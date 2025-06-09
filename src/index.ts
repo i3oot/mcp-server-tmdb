@@ -2,12 +2,17 @@
 
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import express from 'express';
+import { randomUUID } from 'node:crypto';
 import fetch from 'node-fetch';
 import {
   CallToolRequestSchema,
   ListResourcesRequestSchema,
   ListToolsRequestSchema,
   ReadResourceRequestSchema,
+  isInitializeRequest,
 } from "@modelcontextprotocol/sdk/types.js";
 
 // Type definitions
@@ -50,18 +55,19 @@ interface MovieDetails extends Movie {
 const TMDB_API_KEY = process.env.TMDB_API_KEY;
 const TMDB_BASE_URL = "https://api.themoviedb.org/3";
 
-const server = new Server(
-  {
-    name: "example-servers/tmdb",
-    version: "0.1.0",
-  },
-  {
-    capabilities: {
-      resources: {},
-      tools: {},
+function createServer() {
+  const server = new Server(
+    {
+      name: "example-servers/tmdb",
+      version: "0.1.0",
     },
-  }
-);
+    {
+      capabilities: {
+        resources: {},
+        tools: {},
+      },
+    }
+  );
 
 async function fetchFromTMDB<T>(endpoint: string, params: Record<string, string> = {}): Promise<T> {
   const url = new URL(`${TMDB_BASE_URL}${endpoint}`);
@@ -271,14 +277,120 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   }
 });
 
-// Start the server
+  return server;
+}
+
+// Start the server using the transport specified by MCP_TRANSPORT
 if (!TMDB_API_KEY) {
   console.error("TMDB_API_KEY environment variable is required");
   process.exit(1);
 }
 
-const transport = new StdioServerTransport();
-server.connect(transport).catch((error) => {
-  console.error("Server connection error:", error);
-  process.exit(1);
-});
+const transportType = (process.env.MCP_TRANSPORT || 'STDIO').toUpperCase();
+
+switch (transportType) {
+  case 'SSE': {
+    const app = express();
+    app.use(express.json());
+    const transports: Record<string, SSEServerTransport> = {};
+
+    app.get('/mcp', async (req, res) => {
+      const transport = new SSEServerTransport('/messages', res);
+      transports[transport.sessionId] = transport;
+      transport.onclose = () => {
+        delete transports[transport.sessionId];
+      };
+      const server = createServer();
+      await server.connect(transport);
+    });
+
+    app.post('/messages', async (req, res) => {
+      const sessionId = String(req.query.sessionId);
+      const transport = transports[sessionId];
+      if (!transport) {
+        res.status(404).send('Session not found');
+        return;
+      }
+      await transport.handlePostMessage(req, res, req.body);
+    });
+
+    const port = Number(process.env.PORT) || 3000;
+    app.listen(port, () => {
+      console.log(`TMDB MCP server (SSE) listening on port ${port}`);
+    });
+    break;
+  }
+  case 'HTTP': {
+    const app = express();
+    app.use(express.json());
+    const transports: Record<string, StreamableHTTPServerTransport> = {};
+
+    app.post('/mcp', async (req, res) => {
+      let transport: StreamableHTTPServerTransport | undefined;
+      const sessionId = req.headers['mcp-session-id'] as string | undefined;
+      if (sessionId && transports[sessionId]) {
+        transport = transports[sessionId];
+      } else if (!sessionId && isInitializeRequest(req.body)) {
+        transport = new StreamableHTTPServerTransport({
+          sessionIdGenerator: () => randomUUID(),
+        });
+        transport.onclose = () => {
+          const sid = transport!.sessionId;
+          if (sid) delete transports[sid];
+        };
+        const server = createServer();
+        await server.connect(transport);
+        if (transport.sessionId) {
+          transports[transport.sessionId] = transport;
+        }
+      } else {
+        res.status(400).json({
+          jsonrpc: '2.0',
+          error: {
+            code: -32000,
+            message: 'Bad Request: No valid session ID provided',
+          },
+          id: null,
+        });
+        return;
+      }
+
+      await transport.handleRequest(req, res, req.body);
+    });
+
+    app.get('/mcp', async (req, res) => {
+      const sessionId = req.headers['mcp-session-id'] as string | undefined;
+      const transport = sessionId && transports[sessionId];
+      if (!transport) {
+        res.status(400).send('Invalid or missing session ID');
+        return;
+      }
+      await transport.handleRequest(req, res);
+    });
+
+    app.delete('/mcp', async (req, res) => {
+      const sessionId = req.headers['mcp-session-id'] as string | undefined;
+      const transport = sessionId && transports[sessionId];
+      if (!transport) {
+        res.status(400).send('Invalid or missing session ID');
+        return;
+      }
+      await transport.handleRequest(req, res);
+    });
+
+    const port = Number(process.env.PORT) || 3000;
+    app.listen(port, () => {
+      console.log(`TMDB MCP server (HTTP) listening on port ${port}`);
+    });
+    break;
+  }
+  case 'STDIO':
+  default: {
+    const server = createServer();
+    const transport = new StdioServerTransport();
+    server.connect(transport).catch((error) => {
+      console.error('Server connection error:', error);
+      process.exit(1);
+    });
+  }
+}

@@ -112,9 +112,11 @@ The server provides access to TMDB movie information:
    ```
 
 4. Set up your environment variable:
-   ```bash
-   export TMDB_API_KEY=your_api_key_here
-   ```
+ ```bash
+  export TMDB_API_KEY=your_api_key_here
+  # Optional: STDIO (default), SSE, or HTTP
+  export MCP_TRANSPORT=STDIO
+  ```
 
 ### Usage with Claude Desktop
 
@@ -126,7 +128,8 @@ To integrate this server with Claude Desktop, add the following to your app's se
     "tmdb": {
       "command": "/full/path/to/dist/index.js",
       "env": {
-        "TMDB_API_KEY": "your_api_key_here"
+        "TMDB_API_KEY": "your_api_key_here",
+        "MCP_TRANSPORT": "STDIO"
       }
     }
   }
